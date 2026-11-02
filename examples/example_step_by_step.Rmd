@@ -1,0 +1,525 @@
+---
+title: "Step-by-step quality control of PM<sub>2.5</sub> sensor observations using rFILTER"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 3
+    code_folding: show
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5, dpi = 150)
+```
+
+<style>
+.important {
+  border-left: 5px solid #8250df;
+  background-color: #f6f0ff;
+  border-radius: 4px;
+  padding: 10px 16px;
+  margin: 16px 0;
+}
+.important::before {
+  content: "Important";
+  display: block;
+  font-weight: 600;
+  color: #8250df;
+  margin-bottom: 4px;
+}
+.important p {
+  margin: 0;
+}
+</style>
+
+# Introduction
+
+This example shows how to apply the quality control (QC) of rFILTER to PM<sub>2.5</sub> observations from a network of low-cost sensors. The QC tests are applied step by step, in the order of the FILTER methodology:
+
+- Range Validity: `range_validity_qctest()`
+- Constant Value: `constant_value_qctest()`
+- Outlier Detection: `outlier_qctest()` and `spatial_outlier_qctest()`
+- Spatial Correlation: `spatial_correlation_qctest()`
+- Spatial Similarity: `spatial_similarity_qctest()`
+
+Finally, the individual flags are combined into a total quality flag with `quality_flag_function()`. The detailed description of each test is given in its help page (e.g., `?spatial_correlation_qctest`).
+
+The example uses two of the sample datasets included in rFILTER:
+
+- `network_sensor_data`: hourly PM<sub>2.5</sub> observations from a network of low-cost sensors, which are quality controlled.
+- `reference_data`: hourly PM<sub>2.5</sub> observations from reference stations, used as high-quality neighbors in the Spatial Correlation and Spatial Similarity tests.
+
+# Load the package and the datasets
+
+```{r, include = FALSE}
+# packages used only for the tables, charts and maps of this example
+library(tidyr)
+library(leaflet)
+library(leaflet.minicharts)
+library(highcharter)
+library(htmlwidgets)
+```
+
+```{r}
+library(rFILTER)
+library(dplyr)
+
+# load the sensor and reference datasets
+data("network_sensor_data")
+str(network_sensor_data)
+
+data("reference_data")
+str(reference_data)
+```
+
+Both datasets share the same structure: the location identifier (`id`), its coordinates (`longitude` and `latitude`), the timestamp (`timestamp`) and the PM<sub>2.5</sub> concentration. The concentration is stored in `PM2.5` for the sensors and in `value` for the reference stations.
+
+The map below shows the locations of the sensors and the reference stations.
+
+```{r, echo = FALSE, out.width = "100%"}
+sensor_info <- network_sensor_data %>%
+  distinct(id, longitude, latitude)
+
+reference_info <- reference_data %>%
+  distinct(id, longitude, latitude)
+
+leaflet(width = "100%", height = 450) %>%
+  addProviderTiles("Esri.WorldTopoMap") %>%
+  addCircleMarkers(data = sensor_info,
+                   lng = ~longitude, lat = ~latitude,
+                   popup = ~paste("<b>Sensor:</b>", id),
+                   stroke = TRUE, color = "#eb6834", radius = 7, fillOpacity = 0.9) %>%
+  addCircleMarkers(data = reference_info,
+                   lng = ~longitude, lat = ~latitude,
+                   popup = ~paste("<b>Reference station:</b>", id),
+                   stroke = TRUE, color = "#2a78d6", radius = 7, fillOpacity = 0.9) %>%
+  addLegend(position = "topright", colors = c("#eb6834", "#2a78d6"),
+            labels = c("Low-cost sensors", "Reference stations"),
+            title = NULL, opacity = 0.9)
+```
+
+The figure below shows the time series of the raw PM<sub>2.5</sub> observations of each sensor, before QC.
+
+```{r, echo = FALSE, out.width = "100%"}
+highchart(type = "stock") %>%
+  hc_add_series(data = network_sensor_data,
+                hcaes(x = datetime_to_timestamp(timestamp), y = PM2.5, group = id),
+                type = "line") %>%
+  hc_yAxis(title = list(useHTML = TRUE, text = "PM<sub>2.5</sub> (&mu;g m<sup>-3</sup>)"),
+           opposite = FALSE) %>%
+  hc_tooltip(useHTML = TRUE, headerFormat = NULL,
+             pointFormat = "<b>Sensor {series.name}</b><br>{point.x:%Y-%m-%d %H:%M}<br>PM<sub>2.5</sub>: {point.y:.1f} &mu;g m<sup>-3</sup>") %>%
+  hc_legend(enabled = TRUE,
+            layout = "vertical", align = "right", verticalAlign = "top",
+            maxHeight = 300,
+            navigation = list(enabled = TRUE)) %>%
+  hc_size(height = 450)
+```
+
+# Quality control
+
+The QC consists of the following tests, applied in this order.
+
+## Range Validity
+
+- **Purpose:** checks whether observations lie within physically realistic limits. The limits are set with the `upper.bound` and `lower.bound` arguments.
+- **Flag:** `flag_range`
+  - `0`: invalid (out of range)
+  - `1`: valid (within range)
+
+For more information, see `?range_validity_qctest`.
+
+```{r, eval = TRUE}
+sensor_qc_data <- range_validity_qctest(data = network_sensor_data,
+                                        data.column = "PM2.5",
+                                        upper.bound = 1000,
+                                        lower.bound = 0,
+                                        new = FALSE,
+                                        param = "PM2.5")
+
+# count of each flag value (0 = out of range, 1 = within range), including NA
+table(factor(sensor_qc_data$flag_range, levels = c(0, 1),
+             labels = c("0: out of range", "1: within range")), useNA = "always")
+```
+
+## Constant Value
+
+- **Purpose:** checks whether the values remain constant (flatline behavior) within a temporal window. The window and the sensitivity of the test are set with the `persist.duration`, `compl.persist.duration` and `min.variation` arguments.
+- **Flag:** `flag_constant_value`
+  - `0`: invalid (insufficient data)
+  - `1`: invalid (constant)
+  - `2`: valid (not constant)
+
+For more information, see `?constant_value_qctest`.
+
+```{r, eval = TRUE}
+sensor_qc_data <- constant_value_qctest(data = sensor_qc_data,
+                                        date.column = "timestamp",
+                                        data.column = "PM2.5",
+                                        id.column = "id",
+                                        persist.duration = 8,
+                                        compl.persist.duration = 6,
+                                        method = "range",
+                                        min.variation = 0.1,
+                                        new = FALSE,
+                                        param = "PM2.5")
+
+# count of each flag value (0 = insufficient data, 1 = constant, 2 = not constant), including NA
+table(factor(sensor_qc_data$flag_constant_value, levels = c(0, 1, 2),
+             labels = c("0: insufficient data", "1: constant", "2: not constant")), useNA = "always")
+```
+
+## Outlier Detection
+
+- **Purpose:** checks for abnormal values (outliers) within a temporal window. The test is performed in two steps, each with its own function:
+  - `outlier_qctest()`: checks each sensor independently, without considering its neighbors. The window and the sensitivity of the test are defined through `outlier.duration`, `compl.outlier.duration` and `outlier.threshold`.
+  - `spatial_outlier_qctest()`: evaluates the measurements flagged as outliers in the previous step by looking at the wider neighborhood. The neighborhood, with its inner and outer radii in km, is defined through `outlier.radii`, and the number of neighboring sensors required to confirm whether a value is an outlier is given by `outlier.minneigh`.
+
+  With this approach, erroneous outliers flagged by `outlier_qctest()` can be distinguished from real abnormal events (e.g., a pollution episode observed by several nearby sensors).
+
+- **Flag:** `flag_outlier`
+  - `0`: invalid (insufficient data)
+  - `1`: invalid (outlier)
+  - `2`: valid (not an outlier)
+
+For more information, see `?outlier_qctest` and `?spatial_outlier_qctest`.
+
+```{r, eval = TRUE}
+# temporal outlier detection
+sensor_qc_data <- outlier_qctest(data = sensor_qc_data,
+                                 date.column = "timestamp",
+                                 data.column = "PM2.5",
+                                 id.column = "id",
+                                 outlier.duration = 168,
+                                 compl.outlier.duration = 60,
+                                 outlier.threshold = 10,
+                                 new = FALSE,
+                                 param = "PM2.5")
+
+# count of each flag value (0 = insufficient data, 1 = outlier, 2 = not an outlier), including NA
+table(factor(sensor_qc_data$flag_outlier, levels = c(0, 1, 2),
+             labels = c("0: insufficient data", "1: outlier", "2: not an outlier")), useNA = "always")
+
+# spatial outlier detection
+sensor_qc_data <- spatial_outlier_qctest(data = sensor_qc_data,
+                                         date.column = "timestamp",
+                                         data.column = "PM2.5",
+                                         out.flag.column = "flag_outlier",
+                                         id.column = "id",
+                                         x.column = "longitude",
+                                         y.column = "latitude",
+                                         outlier.radii = c(3, 30),
+                                         new = FALSE,
+                                         param = "PM2.5")
+
+# count of each flag value after the spatial check, including NA
+table(factor(sensor_qc_data$flag_outlier, levels = c(0, 1, 2),
+             labels = c("0: insufficient data", "1: outlier", "2: not an outlier")), useNA = "always")
+```
+
+Before moving to the spatial tests, the results of the Range Validity, Constant Value and Outlier Detection tests are summarized below. For each test, a measurement is counted as valid, invalid, or without data. The last row shows the measurements that passed all three tests.
+
+```{r, echo = FALSE}
+qc_three_steps_summary <- bind_rows(
+  tibble(test = "Range Validity",    valid = sensor_qc_data$flag_range == 1),
+  tibble(test = "Constant Value",    valid = sensor_qc_data$flag_constant_value == 2),
+  tibble(test = "Outlier Detection", valid = sensor_qc_data$flag_outlier == 2),
+  tibble(test = "All three tests",   valid = sensor_qc_data$flag_range == 1 &
+                                             sensor_qc_data$flag_constant_value == 2 &
+                                             sensor_qc_data$flag_outlier == 2)
+) %>%
+  mutate(status = case_when(is.na(valid) ~ "No data", valid ~ "Valid", TRUE ~ "Invalid"),
+         status = factor(status, levels = c("Valid", "Invalid", "No data")),
+         test = factor(test, levels = unique(test))) %>%
+  count(test, status, .drop = FALSE) %>%
+  group_by(test) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+# table: number (and percentage) of measurements per test and status
+qc_three_steps_summary %>%
+  mutate(value = paste0(n, " (", percent, "%)")) %>%
+  dplyr::select(test, status, value) %>%
+  pivot_wider(names_from = status, values_from = value) %>%
+  knitr::kable(col.names = c("Test", "Valid", "Invalid", "No data"))
+```
+
+```{r, echo = FALSE, out.width = "100%"}
+# bar chart: share of measurements per test and status
+hchart(qc_three_steps_summary, "bar", hcaes(x = test, y = percent, group = status, n = n)) %>%
+  hc_plotOptions(bar = list(stacking = "normal")) %>%
+  hc_colors(c("#2a78d6", "#eb6834", "#b4b2a9")) %>%
+  hc_xAxis(title = list(text = NULL)) %>%
+  hc_yAxis(title = list(text = "Share of measurements (%)"), max = 100) %>%
+  hc_tooltip(pointFormat = "{series.name}: <b>{point.y:.1f}%</b> ({point.n} measurements)") %>%
+  hc_size(height = 350)
+```
+
+## Spatial Correlation
+
+- **Purpose:** checks whether a sensor is correlated with its neighboring sensors and, if provided, reference stations. The correlation is evaluated in one of two ways:
+  - over the entire measurement period (`historical = FALSE`): the correlation is computed once, and the resulting quality flag is assigned uniformly to all the measurements of the sensor;
+  - within moving temporal windows (`historical = TRUE`): the test runs every day at 23:00 over the preceding `ndays` days, and the resulting quality flag is assigned to the measurements of that day. This gives a time-varying evaluation, at the cost of a considerably longer computation time.
+
+  The neighborhood is defined by an inner and an outer radius, in km, through `corr.radii`, and `compl.corr.threshold` sets the data completeness required within each window or over the entire period. The correlation between a sensor and a neighbor is considered sufficient if it exceeds the threshold given by `expected_correlation()`. A sensor is considered correlated with its neighbors if either of the following holds:
+  - at least one neighbor with a sufficient correlation lies within the inner radius, or
+  - at least `minneigh` neighbors with a sufficient correlation lie within the outer radius.
+
+- **Flag:** `flag_correlation`
+  - `0`: invalid (insufficient data)
+  - `1`: invalid (isolated sensor)
+  - `2`: invalid (not correlated)
+  - `3`: valid (correlated)
+
+For more information, see `?spatial_correlation_qctest` and `?expected_correlation`.
+
+::: {.important}
+In this example, which follows the FILTER workflow, `spatial_correlation_qctest()` uses only the measurements that passed the previous QC tests.
+:::
+
+```{r, eval = TRUE}
+sensor_qc_data <- sensor_qc_data %>%
+  mutate(PM2.5_flagged = ifelse(flag_range == 1 & flag_constant_value == 2 & flag_outlier == 2, PM2.5, NA))
+
+sensor_qc_data <- spatial_correlation_qctest(data = sensor_qc_data,
+                                             date.column = "timestamp",
+                                             data.column = "PM2.5_flagged",
+                                             id.column = "id",
+                                             id.target = NULL,
+                                             rdata = reference_data,
+                                             rdata.column = "value",
+                                             rid.column = "id",
+                                             x.column = "longitude",
+                                             y.column = "latitude",
+                                             compl.corr.threshold = 60,
+                                             corr.radii = c(3, 30),
+                                             minneigh = 2,
+                                             historical = TRUE,
+                                             ndays = 7,
+                                             new = FALSE,
+                                             param = "PM2.5")
+
+sensor_qc_data <- sensor_qc_data %>%
+  dplyr::select(-PM2.5_flagged)
+
+# count of each flag value (0 = insufficient data, 1 = isolated sensor, 2 = not correlated, 3 = correlated), including NA
+table(factor(sensor_qc_data$flag_correlation, levels = c(0, 1, 2, 3),
+             labels = c("0: insufficient data", "1: isolated sensor", "2: not correlated", "3: correlated")),
+      useNA = "always")
+```
+
+## Spatial Similarity
+
+- **Purpose:** checks whether a sensor is similar to its nearest reference stations within a temporal window. The neighborhood is defined through `similarity.radii`, and `compl.similarity.threshold` sets the data completeness required within each window. The similarity between a sensor and a neighboring reference station is considered sufficient if it meets the threshold given by `expected_similarity()`. A sensor is considered similar to its neighbors if it shows sufficient similarity to at least one reference station within the neighborhood.
+- **Flag:** `flag_similarity`
+  - `0`: invalid (insufficient data)
+  - `1`: invalid (isolated sensor)
+  - `2`: invalid (not similar)
+  - `3`: valid (similar)
+
+For more information, see `?spatial_similarity_qctest` and `?expected_similarity`.
+
+::: {.important}
+In this example, which follows the FILTER workflow, `spatial_similarity_qctest()` uses only the measurements that passed all the previous QC tests, including `spatial_correlation_qctest()`.
+:::
+
+```{r, eval = TRUE}
+sensor_qc_data <- sensor_qc_data %>%
+  mutate(PM2.5_flagged = ifelse(flag_range == 1 & flag_constant_value == 2 & flag_outlier == 2 & flag_correlation == 3, PM2.5, NA))
+
+sensor_qc_data <- spatial_similarity_qctest(data = sensor_qc_data,
+                                            date.column = "timestamp",
+                                            data.column = "PM2.5_flagged",
+                                            id.column = "id",
+                                            rdata = reference_data,
+                                            rdata.column = "value",
+                                            rid.column = "id",
+                                            x.column = "longitude",
+                                            y.column = "latitude",
+                                            similarity.radii = 30,
+                                            similarity.duration = 168,
+                                            compl.similarity.threshold = 60,
+                                            new = FALSE,
+                                            param = "PM2.5")
+
+sensor_qc_data <- sensor_qc_data %>%
+  dplyr::select(-PM2.5_flagged)
+
+# count of each flag value (0 = insufficient data, 1 = isolated sensor, 2 = not similar, 3 = similar), including NA
+table(factor(sensor_qc_data$flag_similarity, levels = c(0, 1, 2, 3),
+             labels = c("0: insufficient data", "1: isolated sensor", "2: not similar", "3: similar")),
+      useNA = "always")
+```
+
+The results of all QC steps are summarized below. For the spatial tests, measurements that did not pass the previous steps are also counted as no data.
+
+```{r, echo = FALSE}
+qc_spatial_steps_summary <- bind_rows(
+  tibble(test = "Range Validity<br>Constant Value<br>Outlier Detection",
+         valid = sensor_qc_data$flag_range == 1 &
+                 sensor_qc_data$flag_constant_value == 2 &
+                 sensor_qc_data$flag_outlier == 2),
+  tibble(test = "Spatial Correlation", valid = sensor_qc_data$flag_correlation == 3),
+  tibble(test = "Spatial Similarity",  valid = sensor_qc_data$flag_similarity == 3)) %>%
+  mutate(status = case_when(is.na(valid) ~ "No data", valid ~ "Valid", TRUE ~ "Invalid"),
+         status = factor(status, levels = c("Valid", "Invalid", "No data")),
+         test = factor(test, levels = unique(test))) %>%
+  count(test, status, .drop = FALSE) %>%
+  group_by(test) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+# table: number (and percentage) of measurements per test and status
+qc_spatial_steps_summary %>%
+  mutate(value = paste0(n, " (", percent, "%)")) %>%
+  dplyr::select(test, status, value) %>%
+  pivot_wider(names_from = status, values_from = value) %>%
+  knitr::kable(col.names = c("Test", "Valid", "Invalid", "No data"))
+```
+
+```{r, echo = FALSE, out.width = "100%"}
+# bar chart: share of measurements per test and status
+hchart(qc_spatial_steps_summary, "bar", hcaes(x = test, y = percent, group = status, n = n)) %>%
+  hc_plotOptions(bar = list(stacking = "normal")) %>%
+  hc_colors(c("#2a78d6", "#eb6834", "#b4b2a9")) %>%
+  hc_xAxis(title = list(text = NULL)) %>%
+  hc_yAxis(title = list(text = "Share of measurements (%)"), max = 100) %>%
+  hc_tooltip(pointFormat = "{series.name}: <b>{point.y:.1f}%</b> ({point.n} measurements)") %>%
+  hc_size(height = 350)
+```
+
+## Total quality flag
+
+- **Purpose:** combines the results of the five individual tests, Range Validity (`flag_range`), Constant Value (`flag_constant_value`), Outlier Detection (`flag_outlier`), Spatial Correlation (`flag_correlation`) and Spatial Similarity (`flag_similarity`), into one total quality flag for each measurement.
+- **Flag:** `quality_flag`
+  - `2`: high quality (passed all five tests: `flag_range` = `1`, `flag_constant_value` = `2`, `flag_outlier` = `2`, `flag_correlation` = `3` and `flag_similarity` = `3`)
+  - `1`: good quality (passed the first four tests, but not the Spatial Similarity test: `flag_range` = `1`, `flag_constant_value` = `2`, `flag_outlier` = `2`, `flag_correlation` = `3` and `flag_similarity` = `0`, `1`, `2` or missing)
+  - `0`: other quality (all remaining measurements)
+
+For more information, see `?quality_flag_function`.
+
+```{r, eval = TRUE}
+sensor_qc_data <- quality_flag_function(data = sensor_qc_data,
+                                        data.column = "PM2.5",
+                                        qcflags = c("flag_range", "flag_constant_value",
+                                                    "flag_outlier", "flag_correlation",
+                                                    "flag_similarity"))
+
+# count of each flag value (0 = other, 1 = good, 2 = high), including NA
+table(factor(sensor_qc_data$quality_flag, levels = c(0, 1, 2),
+             labels = c("0: other", "1: good", "2: high")), useNA = "always")
+```
+
+The table and the bar chart show the number and share of measurements for each value of the total quality flag.
+
+```{r, echo = FALSE}
+flag_levels <- c("No data",  "Other", "Good", "High")
+flag_colors <- c("#b4b2a9","#eb6834", "#8fbce8", "#2a78d6")
+
+sensor_flags <- sensor_qc_data %>%
+  mutate(quality = case_when(quality_flag == 2 ~ "High",
+                             quality_flag == 1 ~ "Good",
+                             quality_flag == 0 ~ "Other",
+                             TRUE ~ "No data"),
+         quality = factor(quality, levels = flag_levels))
+
+quality_summary <- sensor_flags %>%
+  count(quality, .drop = FALSE) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+
+# table: number (and percentage) of measurements per total quality flag
+quality_table <- knitr::kable(quality_summary,
+                              col.names = c("Quality flag", "Measurements", "Share (%)"))
+
+# bar chart of the table results
+quality_chart <- hchart(quality_summary %>% mutate(color = flag_colors),
+                        "column", hcaes(x = quality, y = percent, color = color, n = n)) %>%
+  hc_xAxis(title = list(text = NULL)) %>%
+  hc_yAxis(title = list(text = "Share of measurements (%)"), max = 100) %>%
+  hc_tooltip(headerFormat = "<b>{point.key}</b><br>",
+             pointFormat = "{point.y:.1f}% ({point.n} measurements)") %>%
+  hc_legend(enabled = FALSE) %>%
+  hc_size(height = 300)
+```
+
+:::: {.row}
+
+::: {.col-md-6}
+```{r, echo = FALSE}
+quality_table
+```
+:::
+
+::: {.col-md-6}
+```{r, echo = FALSE, out.width = "100%"}
+quality_chart
+```
+:::
+
+::::
+
+The bar chart below shows the share of each quality flag for every sensor, sorted from the highest to the lowest share of high-quality data. Use the scrollbar to see all sensors.
+
+```{r, echo = FALSE, out.width = "100%"}
+per_sensor <- sensor_flags %>%
+  count(id, quality, .drop = FALSE) %>%
+  group_by(id) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+sensor_order <- per_sensor %>%
+    dplyr::filter(quality == "High") %>%
+    arrange(desc(percent)) %>%
+    pull(id) %>%
+    as.character()
+
+hchart(per_sensor %>% mutate(id = factor(as.character(id), levels = sensor_order)),
+       "bar", hcaes(x = id, y = percent, group = quality, n = n)) %>%
+    hc_plotOptions(bar = list(stacking = "normal")) %>%
+    hc_colors(flag_colors) %>%
+    hc_xAxis(title = list(text = "Sensor ID"),
+             min = 0, max = min(9, length(sensor_order) - 1),
+             scrollbar = list(enabled = TRUE)) %>%
+    hc_yAxis(title = list(text = "Share of measurements (%)"), max = 100) %>%
+    hc_tooltip(pointFormat = "{series.name}: <b>{point.y:.1f}%</b> ({point.n} measurements)") %>%
+    hc_size(height = 450)
+```
+
+The map shows the distribution of the total quality flag at each sensor location. Click a sensor to see its numbers.
+
+```{r, echo = FALSE, out.width = "100%"}
+pie_data <- per_sensor %>%
+  mutate(id = as.character(id)) %>%
+  pivot_wider(id_cols = id, names_from = quality, values_from = n,
+              values_fill = 0, names_sort = TRUE) %>%
+  left_join(sensor_info %>% mutate(id = as.character(id)), by = "id")
+
+# popup in the same layout as the default one, with black labels
+popup_html <- sapply(seq_len(nrow(pie_data)), function(i) {
+  counts <- unlist(pie_data[i, flag_levels])
+  rows <- sprintf(
+    "<tr><td style='text-align:right; font-weight:bold; color:#222; padding-right:8px;'>%s :</td><td style='text-align:right;'>%d</td></tr>",
+    flag_levels, counts)
+  paste0("<h3 style='margin:0 0 6px 0;'>", pie_data$id[i], "</h3>",
+         "<table>", paste(rows, collapse = ""), "</table>")
+})
+
+leaflet(width = "100%", height = 450) %>%
+  addProviderTiles("Esri.WorldTopoMap") %>%
+  addCircleMarkers(data = reference_info,
+                   lng = ~longitude, lat = ~latitude,
+                   popup = ~paste("<b>Reference station:</b>", id),
+                   color = "#000000", radius = 3, fillOpacity = 0.9) %>%
+  addMinicharts(lng = pie_data$longitude, lat = pie_data$latitude,
+                type = "pie",
+                chartdata = as.matrix(pie_data[, flag_levels]),
+                colorPalette = flag_colors,
+                width = 22,
+                layerId = as.character(pie_data$id),
+                popup = popupArgs(html = popup_html),
+                legendPosition = "topright")
+```

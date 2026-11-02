@@ -1,0 +1,10 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^doc$
+^Meta$
+^images$
+^docs$
+^ValAir-FILTER\.Rproj$
+^README\.md$
+^README\.html$
+^examples$

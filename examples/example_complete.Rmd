@@ -1,0 +1,359 @@
+---
+title: "Complete QC and correction of PM<sub>2.5</sub> sensor observations using using 'ready-to-use' rFILTER's functions"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 3
+    code_folding: show
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5, dpi = 150)
+```
+
+# Introduction
+
+This example shows how to run the complete FILTER workflow with the two ready-to-use functions of rFILTER, one for each processing level:
+
+- `runFILTER_raw_level()`: applies the full QC procedure directly to the sensor observations. The output assigns a total quality flag (`quality_flag`) to each measurement. 
+- `runFILTER_corrected_level()`: Corrects the sensor observations, and then applies the full QC procedure to the corrected observations. It returns the corrected values, their prediction intervals, the correction flag (`flag_correction`), and a total quality flag (`quality_flag`) to each measurement.
+
+Both functions take the arguments of the individual tests, so the workflow can be tuned in a single call. With the argument `keep`, the output contains either the individual QC flags (`flag_range`, `flag_constant`, `flag_outlier`, `flag_correlation`, and `flag_similarity`) together with the total quality flag (`keep = "flags"`, default) or only the total quality flag (`keep = "none"`).
+
+The individual steps are explained in detail in the step-by-step and correction examples, and the description of each argument is given in the help pages.
+
+More information see in the help pages of `runFILTER_raw_level()` and  `runFILTER_corrected_level()`.
+
+The example uses three of the sample datasets included in rFILTER:
+
+- `network_sensor_data`: hourly PM<sub>2.5</sub> observations from a network of low-cost sensors, which are corrected.
+- `reference_data`: hourly PM<sub>2.5</sub> observations from reference stations, used as high-quality neighbors to derive the correction.
+- `meteorological_data`: hourly meteorological observations (air temperature and relative humidity) from weather stations, used as optional auxiliary data in the correction.
+
+# Load the package and the datasets
+
+```{r, include = FALSE}
+# packages used only for the tables and charts of this example
+library(tidyr)
+library(highcharter)
+```
+
+```{r}
+library(rFILTER)
+library(dplyr)
+
+data("network_sensor_data")
+str(network_sensor_data)
+
+data("reference_data")
+str(reference_data)
+
+data("meteorological_data")
+str(meteorological_data)
+```
+
+# Running the functions with the default arguments
+
+The quickest way to process the sensor observations is to run the two functions with their default arguments. Only the datasets and the names of their columns need to be given; all the other arguments of the QC tests and the correction take their default values (see the help pages).
+
+```{r, eval = FALSE}
+# raw processing level
+sensor_raw_default <- runFILTER_raw_level(data = network_sensor_data,
+                                          date.column = "timestamp",
+                                          data.column = "PM2.5",
+                                          id.column = "id",
+                                          x.column = "longitude",
+                                          y.column = "latitude",
+                                          rdata = reference_data, # if rdata are not available rdata = NULL, rdata.column = NULL, and rid.column = NULL
+                                          rdata.column = "value",
+                                          rid.column = "id")
+
+# corrected processing level
+sensor_corrected_default <- runFILTER_corrected_level(data = network_sensor_data,
+                                                      date.column = "timestamp",
+                                                      data.column = "PM2.5",
+                                                      id.column = "id",
+                                                      x.column = "longitude",
+                                                      y.column = "latitude",
+                                                      rdata = reference_data,
+                                                      rdata.column = "value",
+                                                      rid.column = "id",
+                                                      mdata = meteorological_data, # if mdata are not available mdata = NULL, mdata.column = NULL, and mid.column = NULL
+                                                      mdata.column = c("Temperature", "Humidity"), 
+                                                      mid.column = "code")
+```
+# Running the functions with user-defined arguments
+
+The examples below set the arguments explicitly, with the same values as in the step-by-step and correction examples.
+
+## <i>Raw</i> processing level
+
+`runFILTER_raw_level()` runs the full QC procedure on the sensor observations. The reference observations are used in the Spatial Correlation and Spatial Similarity tests.
+
+```{r, eval = TRUE}
+sensor_raw_level <- runFILTER_raw_level(data = network_sensor_data,
+                                        date.column = "timestamp",
+                                        data.column = "PM2.5",
+                                        id.column = "id",
+                                        x.column = "longitude",
+                                        y.column = "latitude",
+                                        # range validity
+                                        upper.bound = 1000,
+                                        lower.bound = 0,
+                                        # constant value
+                                        persist.duration = 8,
+                                        compl.persist.duration = 6,
+                                        min.variation = 0.1,
+                                        # outlier detection
+                                        outlier.duration = 168,
+                                        compl.outlier.duration = 60,
+                                        outlier.threshold = 10,
+                                        outlier.radii = c(3, 30),
+                                        # spatial correlation
+                                        rdata = reference_data,
+                                        rdata.column = "value",
+                                        rid.column = "id",
+                                        compl.corr.threshold = 60,
+                                        corr.radii = c(3, 30),
+                                        minneigh = 2,
+                                        historical = TRUE,
+                                        ndays = 7,
+                                        # spatial similarity
+                                        similarity.radii = 30,
+                                        similarity.duration = 168,
+                                        compl.similarity.threshold = 60,
+                                        param = "PM2.5",
+                                        keep = "flags")
+
+str(sensor_raw_level)
+
+# count of each total quality flag value (0 = other, 1 = good, 2 = high), including NA
+table(factor(sensor_raw_level$quality_flag, levels = c(0, 1, 2),
+             labels = c("0: other", "1: good", "2: high")), useNA = "always")
+```
+
+## <i>Corrected</i> processing level
+
+`runFILTER_corrected_level()` corrects the sensor observations that passed the first QC tests and then runs the full QC procedure on the corrected observations. Besides the reference observations, the meteorological observations are used as auxiliary data in the correction.
+
+```{r, eval = TRUE}
+sensor_corrected_level <- runFILTER_corrected_level(data = network_sensor_data,
+                                                    date.column = "timestamp",
+                                                    data.column = "PM2.5",
+                                                    id.column = "id",
+                                                    x.column = "longitude",
+                                                    y.column = "latitude",
+                                                    # range validity
+                                                    upper.bound = 1000,
+                                                    lower.bound = 0,
+                                                    # constant value
+                                                    persist.duration = 8,
+                                                    compl.persist.duration = 0.75,
+                                                    min.variation = 0.1,
+                                                    # outlier detection
+                                                    outlier.duration = 168,
+                                                    compl.outlier.duration = 0.25,
+                                                    outlier.threshold = 10,
+                                                    outlier.radii = c(3, 30),
+                                                    # spatial correlation
+                                                    rdata = reference_data,
+                                                    rdata.column = "value",
+                                                    rid.column = "id",
+                                                    compl.corr.threshold = 60,
+                                                    corr.radii = c(3, 30),
+                                                    minneigh = 2,
+                                                    historical = TRUE,
+                                                    ndays = 7,
+                                                    # spatial similarity
+                                                    similarity.radii = 30,
+                                                    similarity.duration = 168,
+                                                    compl.similarity.threshold = 60,
+                                                    # correction
+                                                    mdata = meteorological_data,
+                                                    mdata.column = c("Temperature", "Humidity"),
+                                                    mid.column = "code",
+                                                    m.radii = 30,
+                                                    historical.corr = FALSE,
+                                                    ndays.corr = 7,
+                                                    nmin = 10,
+                                                    compl.correction.threshold = 60,
+                                                    conf.level = 0.95,
+                                                    robust = TRUE,
+                                                    split = FALSE,
+                                                    param = "PM2.5",
+                                                    keep = "flags")
+
+str(sensor_corrected_level)
+
+# count of each correction flag value (0 = insufficient data, 1 = isolated site, 2 = no improvement, 3 = improvement), including NA
+table(factor(sensor_corrected_level$flag_correction, levels = c(0, 1, 2, 3),
+             labels = c("0: insufficient data", "1: isolated site", "2: no improvement", "3: improvement")),
+      useNA = "always")
+
+# count of each total quality flag value of the corrected observations, including NA
+table(factor(sensor_corrected_level$quality_flag, levels = c(0, 1, 2),
+             labels = c("0: other", "1: good", "2: high")), useNA = "always")
+```
+
+## Comparison of the two processing levels
+
+The table and the bar chart compare the total quality flag of the <i>Raw</i> and the <i>Corrected</i> observations.
+
+```{r, echo = FALSE}
+flag_levels <- c("No data", "Other", "Good",  "High")
+
+quality_levels <- bind_rows(tibble(level = "Raw", quality_flag = sensor_raw_level$quality_flag),
+                            tibble(level = "Corrected", quality_flag = sensor_corrected_level$quality_flag)) %>%
+  mutate(quality = case_when(quality_flag == 2 ~ "High",
+                             quality_flag == 1 ~ "Good",
+                             quality_flag == 0 ~ "Other",
+                             TRUE ~ "No data"),
+         quality = factor(quality, levels = flag_levels),
+         level = factor(level, levels = c("Raw", "Corrected"))) %>%
+  count(level, quality, .drop = FALSE) %>%
+  group_by(level) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+# table: number (and percentage) of measurements per processing level and total quality flag
+levels_table <- quality_levels %>%
+  mutate(value = paste0(n, " (", percent, "%)")) %>%
+  dplyr::select(quality, level, value) %>%
+  pivot_wider(names_from = level, values_from = value) %>%
+  knitr::kable(col.names = c("Quality flag", "Raw", "Corrected"))
+
+# bar chart: share of measurements per total quality flag, for each processing level
+levels_chart <- hchart(quality_levels, "column", hcaes(x = quality, y = percent, group = level, n = n)) %>%
+  hc_colors(c("#eb6834", "#2a78d6")) %>%
+  hc_xAxis(title = list(text = NULL)) %>%
+  hc_yAxis(title = list(text = "Share of measurements (%)"), max = 100) %>%
+  hc_tooltip(pointFormat = "{series.name}: <b>{point.y:.1f}%</b> ({point.n} measurements)") %>%
+  hc_size(height = 320)
+```
+
+:::: {.row}
+
+::: {.col-md-6}
+```{r, echo = FALSE}
+levels_table
+```
+:::
+
+::: {.col-md-6}
+```{r, echo = FALSE, out.width = "100%"}
+levels_chart
+```
+:::
+
+::::
+
+The map shows the sensors and the reference stations. Click a sensor to see its time series: the upper chart shows the <i>Raw</i> observations and the lower chart the corrected observations, each with the measurements of Good and High quality highlighted. Drag across a chart to zoom in, and click a legend item to hide or show a series.
+
+```{r, echo = FALSE, out.width = "100%"}
+sensor_info <- network_sensor_data %>%
+  distinct(id, longitude, latitude) %>%
+  arrange(id)
+
+reference_info <- reference_data %>%
+  distinct(id, longitude, latitude)
+
+# values of a column, kept only where the total quality flag has the given value (NA elsewhere)
+keep_flag <- function(v, flag, value) ifelse(flag %in% value, v, NA)
+
+# time series of each sensor at both processing levels, as [time in ms, value] pairs (NA becomes a gap)
+popup_data <- lapply(sensor_info$id, function(s) {
+    r <- sensor_raw_level %>% dplyr::filter(id == s) %>% arrange(timestamp)
+    k <- sensor_corrected_level %>% dplyr::filter(id == s) %>% arrange(timestamp)
+    xr <- as.numeric(r$timestamp) * 1000
+    xk <- as.numeric(k$timestamp) * 1000
+    list(ref      = cbind(xk, k$value),     # reference observations at the sensor location
+         raw_all  = cbind(xr, r$PM2.5),
+         raw_good = cbind(xr, keep_flag(r$PM2.5, r$quality_flag, 1)),
+         raw_high = cbind(xr, keep_flag(r$PM2.5, r$quality_flag, 2)),
+         cor_raw  = cbind(xk, k$PM2.5),     # raw observations, shown in the corrected chart
+         cor_all  = cbind(xk, k$PM2.5_cor),
+         cor_good = cbind(xk, keep_flag(k$PM2.5_cor, k$quality_flag, 1)),
+         cor_high = cbind(xk, keep_flag(k$PM2.5_cor, k$quality_flag, 2)))
+})
+names(popup_data) <- as.character(sensor_info$id)
+
+# popup: two boxes, one for each chart
+popup_html <- sprintf(paste0('<div class="hc-popup" data-id="%s">',
+                             '<div class="hc-raw" style="width:500px; height:240px;"></div>',
+                             '<div class="hc-cor" style="width:500px; height:240px;"></div></div>'),
+                      sensor_info$id)
+
+# JavaScript: draw the two charts of the sensor when its popup opens
+popup_chart_js <- "
+function(el, x, data) {
+  // isolated hours (no flagged neighbours) are not drawn as a line, so the
+  // High quality series also shows a small dot at each value
+  var dots = {enabled: true, radius: 2};
+  function drawChart(div, title, series) {
+    Highcharts.chart(div, {
+      chart: {zoomType: 'x'},
+      title: {text: title, style: {fontSize: '13px'}},
+      credits: {enabled: false},
+      exporting: {enabled: false},
+      xAxis: {type: 'datetime'},
+      yAxis: {min: 0, title: {useHTML: true, text: 'PM<sub>2.5</sub> (&mu;g m<sup>-3</sup>)'}},
+      tooltip: {shared: true, valueDecimals: 1, xDateFormat: '%Y-%m-%d %H:%M'},
+      legend: {itemStyle: {fontSize: '11px'}},
+      plotOptions: {series: {label: {enabled: false},
+                             marker: {enabled: false, symbol: 'circle', radius: 3,
+                                      states: {hover: {radius: 4}}}}},
+      series: series
+    });
+  }
+  this.on('popupopen', function(e) {
+    setTimeout(function() {
+      var box = e.popup._contentNode.querySelector('.hc-popup');
+      if (!box) return;
+      if (typeof Highcharts === 'undefined') {
+        box.innerHTML = 'Highcharts is not loaded.';
+        return;
+      }
+      var id = box.getAttribute('data-id');
+      var d = data[id];
+      drawChart(box.querySelector('.hc-raw'), 'Sensor ' + id + ': Raw observations', [
+        {name: 'Reference', data: d.ref, color: '#333333', lineWidth: 1},
+        {name: 'All', data: d.raw_all, color: '#b4b2a9', lineWidth: 1},
+        {name: 'Good quality', data: d.raw_good, color: '#8fbce8', lineWidth: 1.5},
+        {name: 'High quality', data: d.raw_high, color: '#2a78d6', lineWidth: 1.5, marker: dots}
+      ]);
+      drawChart(box.querySelector('.hc-cor'), 'Sensor ' + id + ': Corrected observations', [
+        {name: 'Reference', data: d.ref, color: '#333333', lineWidth: 1},
+        {name: 'Raw', data: d.cor_raw, color: '#eb6834', lineWidth: 1},
+        {name: 'All', data: d.cor_all, color: '#b4b2a9', lineWidth: 1},
+        {name: 'Good quality', data: d.cor_good, color: '#8fbce8', lineWidth: 1.5},
+        {name: 'High quality', data: d.cor_high, color: '#2a78d6', lineWidth: 1.5, marker: dots}
+      ]);
+    }, 50);
+  });
+}"
+
+sensor_map <- leaflet(width = "100%", height = 600) %>%
+  addProviderTiles("Esri.WorldTopoMap") %>%
+  addCircleMarkers(data = reference_info,
+                   lng = ~longitude, lat = ~latitude,
+                   popup = ~paste("<b>Reference station:</b>", id),
+                   color = "#2a78d6", radius = 7, fillOpacity = 0.9) %>%
+  addCircleMarkers(data = sensor_info,
+                   lng = ~longitude, lat = ~latitude,
+                   color = "#eb6834", radius = 7, fillOpacity = 0.9,
+                   popup = popup_html,
+                   popupOptions = popupOptions(maxWidth = 540, minWidth = 520)) %>%
+  addLegend(position = "topright", colors = c("#eb6834", "#2a78d6"),
+            labels = c("Low-cost sensors", "Reference stations"), opacity = 0.9) %>%
+  onRender(popup_chart_js, data = popup_data)
+
+# attach the Highcharts library to the map, so the popups can draw charts on their own
+sensor_map$dependencies <- c(sensor_map$dependencies,
+                             htmlwidgets::getDependency("highchart", "highcharter"))
+sensor_map
+```
