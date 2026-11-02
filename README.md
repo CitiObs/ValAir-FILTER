@@ -94,7 +94,7 @@ The QC and correction algorithms and their main helper functions are listed belo
 ### Correction
 
 | Description | Function | Main helper functions |
-|:---|:---|:---|:---|
+|:---|:---|:---|
 | Corrects the sensor observations using nearby reference stations and, optionally, meteorological stations | `correction_process()` | `find_neighbors()` <br> `modified_idw_function()` <br> `min_variability_function()` <br> `correction_function()` |
 
 ### Quality flags
