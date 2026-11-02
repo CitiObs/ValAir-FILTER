@@ -149,7 +149,7 @@ tail(network_sensor_data)
 
 The columns are assigned to the function arguments as follows:
 
-| Column | Type | Description | Argument |
+| Column | Type | Description |
 |:---|:---|:---|
 | `id` | numeric | Identifier (ID) of the measurement location |
 | `timestamp` | POSIXct | Timestamp of each measurement (UTC) |
