@@ -1,0 +1,480 @@
+---
+title: "Correction of PM<sub>2.5</sub> sensor observations using rFILTER"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 3
+    code_folding: show
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5, dpi = 150)
+```
+<style>
+.tip {
+  border-left: 5px solid #8250df;
+  background-color: #f6f0ff;
+  border-radius: 4px;
+  padding: 10px 16px;
+  margin: 16px 0;
+}
+.tip::before {
+  content: "Tip";
+  display: block;
+  font-weight: 600;
+  color: #8250df;
+  margin-bottom: 4px;
+}
+.tip p {
+  margin: 0;
+}
+</style>
+
+# Introduction
+
+This example shows how to apply the correction of rFILTER to PM<sub>2.5</sub> observations from a network of low-cost sensors. The correction is performed with `correction_process()` in one of two ways:
+
+- over the entire measurement period (`historical.corr = FALSE`): the correction is derived once, and the resulting quality flag (`flag_correction`) is assigned uniformly to all the measurements of the sensor;
+- within moving temporal windows (`historical.corr = TRUE`): the correction is derived every day at 23:00 from the preceding `ndays.corr` days, and the resulting quality flag is assigned to the measurements of that day. This gives a time-varying correction, at the cost of a considerably longer computation time.
+
+The example uses three of the sample datasets included in rFILTER:
+
+- `network_sensor_data`: hourly PM<sub>2.5</sub> observations from a network of low-cost sensors, which are corrected.
+- `reference_data`: hourly PM<sub>2.5</sub> observations from reference stations, used as high-quality neighbors to derive the correction.
+- `meteorological_data`: hourly meteorological observations (air temperature and relative humidity) from weather stations, used as optional auxiliary data in the correction.
+
+The output of the correction is summarized as:
+
+- **Corrected values:** the corrected observations, with their lower and upper prediction intervals. The level of the intervals is set with `conf.level` (95% by default).
+- **Reference values:** the reference observations at the sensor location, interpolated from the nearby reference stations.
+- **Flag:** `flag_correction`
+  - `0`: invalid (insufficient data)
+  - `1`: invalid (isolated site)
+  - `2`: invalid (no improvement over the <i>Raw</i> observations)
+  - `3`: valid (improvement over the <i>Raw</i> observations)
+
+The detailed description of the correction and its helper functions is given in their help pages (e.g., `?correction_process`).
+
+# Load the package and the datasets
+
+```{r, include = FALSE}
+# packages used only for the tables, charts and maps of this example
+library(tidyr)
+library(leaflet)
+library(leaflet.minicharts)
+library(highcharter)
+library(htmlwidgets)
+```
+
+```{r, eval = TRUE}
+library(rFILTER)
+library(dplyr)
+
+# load the sensor, reference and meteorological datasets
+data("network_sensor_data")
+str(network_sensor_data)
+
+data("reference_data")
+str(reference_data)
+
+data("meteorological_data")
+str(meteorological_data)
+```
+
+All datasets contain the location identifier, its coordinates (`longitude` and `latitude`) and the timestamp (`timestamp`). The sensor and reference datasets identify each location by `id` and store the PM<sub>2.5</sub> concentration in `PM2.5` and `value`, respectively. The meteorological dataset identifies each weather station by `code` and stores the air temperature and relative humidity in `Temperature` and `Humidity`.
+
+The map below shows the locations of the sensors, the reference stations and the weather stations.
+
+```{r, echo = FALSE, out.width = "100%"}
+sensor_info <- network_sensor_data %>%
+  distinct(id, longitude, latitude)
+
+reference_info <- reference_data %>%
+  distinct(id, longitude, latitude)
+
+meteo_info <- meteorological_data %>%
+  distinct(code, longitude, latitude)
+
+leaflet(width = "100%", height = 450) %>%
+  addProviderTiles("Esri.WorldTopoMap") %>%
+  addCircleMarkers(data = sensor_info,
+                   lng = ~longitude, lat = ~latitude,
+                   popup = ~paste("<b>Sensor:</b>", id),
+                   stroke = TRUE, color = "#eb6834", radius = 7, fillOpacity = 0.9) %>%
+  addCircleMarkers(data = reference_info,
+                   lng = ~longitude, lat = ~latitude,
+                   popup = ~paste("<b>Reference station:</b>", id),
+                   stroke = TRUE, color = "#2a78d6", radius = 7, fillOpacity = 0.9) %>%
+  addCircleMarkers(data = meteo_info,
+                   lng = ~longitude, lat = ~latitude,
+                   popup = ~paste("<b>Weather station:</b>", code),
+                   stroke = TRUE, color = "#1baf7a", radius = 7, fillOpacity = 0.9) %>%
+  addLegend(position = "topright",
+            colors = c("#eb6834", "#2a78d6", "#1baf7a"),
+            labels = c("Low-cost sensors", "Reference stations", "Weather stations"),
+            title = NULL, opacity = 0.9)
+```
+
+# Correction process
+
+## QC before the correction
+
+Only the <i>Raw</i> observations that pass the first QC tests (Range Validity, Constant Value and Outlier Detection) are used to derive the correction function of each sensor. These tests are therefore applied first, and the observations that did not pass them are set to `NA` in a new column (`PM2.5_flagged`).
+
+```{r, eval = TRUE}
+# range validity
+sensor_qc_data <- range_validity_qctest(data = network_sensor_data,
+                                        data.column = "PM2.5",
+                                        upper.bound = 1000,
+                                        lower.bound = 0,
+                                        new = FALSE,
+                                        param = "PM2.5")
+
+# constant value
+sensor_qc_data <- constant_value_qctest(data = sensor_qc_data,
+                                        date.column = "timestamp",
+                                        data.column = "PM2.5",
+                                        id.column = "id",
+                                        persist.duration = 8,
+                                        compl.persist.duration = 0.75,
+                                        method = "range",
+                                        min.variation = 0.1,
+                                        new = FALSE,
+                                        param = "PM2.5")
+
+# temporal outlier detection
+sensor_qc_data <- outlier_qctest(data = sensor_qc_data,
+                                 date.column = "timestamp",
+                                 data.column = "PM2.5",
+                                 id.column = "id",
+                                 outlier.duration = 168,
+                                 compl.outlier.duration = 0.25,
+                                 outlier.threshold = 10,
+                                 new = FALSE,
+                                 param = "PM2.5")
+
+# spatial outlier detection
+sensor_qc_data <- spatial_outlier_qctest(data = sensor_qc_data,
+                                         date.column = "timestamp",
+                                         data.column = "PM2.5",
+                                         out.flag.column = "flag_outlier",
+                                         id.column = "id",
+                                         x.column = "longitude",
+                                         y.column = "latitude",
+                                         outlier.radii = c(2, 25),
+                                         new = FALSE,
+                                         param = "PM2.5")
+
+str(sensor_qc_data)
+
+# observations that passed the first three tests (the others are set to NA)
+sensor_qc_data <- sensor_qc_data %>%
+  mutate(PM2.5_flagged = ifelse(flag_range == 1 & flag_constant_value == 2 & flag_outlier == 2, PM2.5, NA))
+
+```
+
+## Correction
+
+The <i>Raw</i> observations that pass the first QC tests are then used, together with data from nearby reference and weather stations, to derive the correction function of each sensor. Reference stations are considered up to a maximum distance that depends on the season of the sensor observations (see `lut_distance_fun()`), and weather stations up to a radius of `m.radii` km. The correction relies on the following helper functions:
+
+- `find_neighbors()`: finds the nearby reference and weather stations.
+- `modified_idw_function()`: if several stations are found, interpolates their PM<sub>2.5</sub> concentrations and meteorological parameters to the sensor location, using inverse distance weighting with modified Shepard weights.
+- `min_variability_function()`: selects the hours of low variability, so that the correction is derived from the general tendency of the measurements rather than from short-term fluctuations.
+- `correction_function()`: fits (robust) linear models and returns the corrected values and their prediction intervals.
+
+Once derived, the correction function is applied to all <i>Raw</i> observations of the sensor, including those that did not pass the first QC tests, so that a corrected value is available for every measurement.
+
+The efficiency of the correction is then assessed by comparing the root mean squared deviation (RMSD) of the <i>Raw</i> and of the corrected observations against the reference observations. The result is stored in the quality flag `flag_correction`: a lower RMSD after the correction indicates an improvement over the <i>Raw</i> observations (`3`), whereas an equal or higher RMSD indicates no improvement (`2`).
+
+::: {.tip}
+The correction can be run in three ways with `correction_process()`:
+
+- over the entire measurement period: `historical.corr = FALSE` and `split = FALSE`;
+- over the entire measurement period, but correcting only the measurements of the last day: `historical.corr = FALSE` and `split = TRUE`;
+- within moving temporal windows of `ndays.corr` days: `historical.corr = TRUE` (`split` can be either `TRUE` or `FALSE`).
+
+More details are given in the help page of the correction (`?correction_process`).
+:::
+
+In this example the sensors have only about 30 days of measurements, so the correction is derived over the entire time series (`historical.corr = FALSE` and `split = FALSE`). In this case `ndays.corr` is not used.
+
+In this example the sensors only have about 30 days of data, so the correction is fitted
+on the whole time series at once.
+
+```{r, eval = TRUE}
+sensor_corrected_data <- correction_process(data = sensor_qc_data,
+                                            date.column = "timestamp",
+                                            data.column = "PM2.5",
+                                            data.flag.column = "PM2.5_flagged",
+                                            id.column = "id",
+                                            rdata = reference_data,
+                                            rdata.column = "value",
+                                            rid.column = "id",
+                                            mdata = meteorological_data,
+                                            mdata.column = c("Temperature", "Humidity"),
+                                            mid.column = "code",
+                                            x.column = "longitude",
+                                            y.column = "latitude",
+                                            m.radii = 30,
+                                            nmin = 10,
+                                            compl.correction.threshold = 60,
+                                            conf.level = 0.95,
+                                            robust = TRUE,
+                                            historical.corr = FALSE,
+                                            param = "PM2.5",
+                                            split = FALSE)
+
+str(sensor_corrected_data)
+
+# count of each flag value (0 = insufficient data, 1 = isolated site, 2 = no improvement, 3 = improvement), including NA
+table(factor(sensor_corrected_data$flag_correction, levels = c(0, 1, 2, 3),
+             labels = c("0: insufficient data", "1: isolated site", "2: no improvement", "3: improvement")),
+      useNA = "always")
+```
+
+## Results
+
+### Correction flag
+
+The table and the bar chart show the number and share of measurements for each value of the correction flag.
+
+```{r, echo = FALSE}
+corr_levels <- c("No data", "Insufficient data", "Isolated site", "No improvement", "Improvement")
+corr_colors <- c("#b4b2a9", "#e87ba4", "#eda100", "#eb6834", "#2a78d6")
+
+corr_summary <- sensor_corrected_data %>%
+  mutate(correction = case_when(flag_correction == 3 ~ "Improvement",
+                                flag_correction == 2 ~ "No improvement",
+                                flag_correction == 1 ~ "Isolated site",
+                                flag_correction == 0 ~ "Insufficient data",
+                                TRUE ~ "No data"),
+         correction = factor(correction, levels = corr_levels)) %>%
+  count(correction, .drop = FALSE) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+
+corr_table <- knitr::kable(corr_summary, col.names = c("Correction flag", "Measurements", "Share (%)"))
+
+corr_chart <- hchart(corr_summary %>% mutate(color = corr_colors),
+                     "column", hcaes(x = correction, y = percent, color = color, n = n)) %>%
+  hc_xAxis(title = list(text = NULL)) %>%
+  hc_yAxis(title = list(text = "Share of measurements (%)"), max = 100) %>%
+  hc_tooltip(headerFormat = "<b>{point.key}</b><br>",
+             pointFormat = "{point.y:.1f}% ({point.n} measurements)") %>%
+  hc_legend(enabled = FALSE) %>%
+  hc_size(height = 300)
+```
+
+:::: {.row}
+
+::: {.col-md-6}
+```{r, echo = FALSE}
+corr_table
+```
+:::
+
+::: {.col-md-6}
+```{r, echo = FALSE, out.width = "100%"}
+corr_chart
+```
+:::
+
+::::
+
+### Efficiency of the correction
+
+For each sensor, the RMSD against the reference observations is computed for the <i>Raw</i> and the corrected values, over the hours where all three are available. The table gives the statistics of the RMSD across sensors, and in the boxplot each point is one sensor.
+
+```{r, echo = FALSE}
+
+# RMSD of the raw and corrected values against the reference observations, for each sensor
+rmsd_per_sensor <- sensor_corrected_data %>%
+  group_by(id) %>%
+  summarise(Raw = sqrt(mean((PM2.5 - value)^2, na.rm = TRUE)),
+            Corrected = sqrt(mean((PM2.5_cor - value)^2, na.rm=TRUE)),
+            .groups = "drop")
+
+rmsd_long <- rmsd_per_sensor %>%
+  pivot_longer(c(Raw, Corrected), names_to = "data", values_to = "rmsd") %>%
+  mutate(data = factor(data, levels = c("Raw", "Corrected")))
+
+groups <- levels(rmsd_long$data)
+group_colors <- c(Raw = "#eb6834", Corrected = "#2a78d6")
+group_fills  <- c(Raw = "rgba(235, 104, 52, 0.20)", Corrected = "rgba(42, 120, 214, 0.20)")
+
+# table: general statistics of the RMSD per data type
+rmsd_stats <- rmsd_long %>%
+  group_by(data) %>%
+  summarise(sensors = sum(!is.na(rmsd)),
+            min = min(rmsd, na.rm = TRUE),
+            q1 = quantile(rmsd, 0.25, na.rm = TRUE),
+            median = median(rmsd, na.rm = TRUE),
+            mean = mean(rmsd, na.rm = TRUE),
+            q3 = quantile(rmsd, 0.75, na.rm = TRUE),
+            max = max(rmsd, na.rm = TRUE),
+            .groups = "drop")
+
+# digits = 1 shows one decimal in every column (e.g., 12.0, not 12)
+rmsd_table <- knitr::kable(rmsd_stats, digits = 1,
+                           col.names = c("Data", "Sensors", "Min", "Q1", "Median", "Mean", "Q3", "Max"))
+
+# points: one per sensor, slightly spread horizontally so they do not overlap
+set.seed(1)
+points <- rmsd_long %>%
+  dplyr::filter(!is.na(rmsd)) %>%
+  mutate(x = as.numeric(data) - 1 + runif(n(), -0.15, 0.15), y = round(rmsd, 1))
+
+# boxplot with the points of the sensors
+rmsd_chart <- highchart() %>%
+  hc_chart(type = "boxplot") %>%
+  hc_plotOptions(boxplot = list(grouping = FALSE)) %>%
+  hc_xAxis(categories = groups, title = list(text = NULL)) %>%
+  hc_yAxis(title = list(useHTML = TRUE, text = "RMSD (&mu;g m<sup>-3</sup>)"), min = 0) %>%
+  hc_legend(enabled = FALSE) %>%
+  hc_size(height = 400)
+
+for (i in seq_along(groups)) {
+  g <- groups[i]
+  s <- boxplot.stats(na.omit(rmsd_long$rmsd[rmsd_long$data == g]))$stats
+  rmsd_chart <- rmsd_chart %>%
+    hc_add_series(name = g, type = "boxplot",
+                  data = list(list(x = i - 1, low = s[1], q1 = s[2], median = s[3], q3 = s[4], high = s[5])),
+                  color = group_colors[[g]], fillColor = group_fills[[g]],
+                  lineWidth = 1.5, medianColor = group_colors[[g]], medianWidth = 3,
+                  stemColor = group_colors[[g]], stemWidth = 1.5,
+                  whiskerColor = group_colors[[g]], whiskerWidth = 1.5, whiskerLength = "50%",
+                  tooltip = list(headerFormat = "<b>{series.name}</b><br>",
+                                 pointFormat = paste0("Maximum: {point.high:.1f}<br>Q3: {point.q3:.1f}<br>",
+                                                      "Median: {point.median:.1f}<br>Q1: {point.q1:.1f}<br>",
+                                                      "Minimum: {point.low:.1f}")))
+}
+
+for (g in groups) {
+  rmsd_chart <- rmsd_chart %>%
+    hc_add_series(name = g, type = "scatter", color = group_colors[[g]], zIndex = 2,
+                  marker = list(radius = 3, symbol = "circle", fillColor = "rgba(255,255,255,0)",
+                                lineWidth = 1, lineColor = group_colors[[g]], states = list(hover = list(fillColor = "rgba(255,255,255,0)", lineColor = group_colors[[g]]))),
+                  data = list_parse(points %>% dplyr::filter(data == g) %>% dplyr::select(x, y, id)),
+                  tooltip = list(headerFormat = "",
+                                 pointFormat = "<b>Sensor {point.id}</b><br>{series.name}: {point.y:.1f} &mu;g m<sup>-3</sup>"))
+}
+```
+
+:::: {.row}
+
+::: {.col-md-6}
+```{r, echo = FALSE}
+rmsd_table
+```
+:::
+
+::: {.col-md-6}
+```{r, echo = FALSE, out.width = "100%"}
+rmsd_chart
+```
+:::
+
+::::
+
+### Correction of each sensor
+
+The map below shows the correction result of each sensor. Click a sensor to see its <i>Raw</i>, reference and corrected PM<sub>2.5</sub> observations, together with the prediction interval of the corrected values. Drag across the chart to zoom in, and click a legend item to hide or show a series.
+
+```{r, echo = FALSE, out.width = "100%"}
+library(leaflet.minicharts)
+
+# share of each correction flag per sensor (over all days) and its location
+pie_data <- sensor_corrected_data %>%
+  mutate(correction = case_when(flag_correction == 3 ~ "Improvement",
+                                flag_correction == 2 ~ "No improvement",
+                                flag_correction == 1 ~ "Isolated site",
+                                flag_correction == 0 ~ "Insufficient data",
+                                TRUE ~ "No data"),
+         correction = factor(correction, levels = corr_levels)) %>%
+  count(id, correction, .drop = FALSE) %>%
+  pivot_wider(names_from = correction, values_from = n, values_fill = 0) %>%
+  left_join(sensor_info, by = "id") %>%
+  arrange(id)
+
+# popup: an empty box in which the chart of the sensor is drawn
+popup_html <- sprintf('<div class="hc-popup" data-id="%s" style="width:480px; height:280px;"></div>', pie_data$id)
+
+# time series of each sensor, as [time in ms, value] pairs (NA becomes a gap)
+popup_data <- lapply(pie_data$id, function(s) {
+  d <- sensor_corrected_data %>%
+    dplyr::filter(id == s) %>%
+    arrange(timestamp)
+  x <- as.numeric(d$timestamp) * 1000
+  list(raw = cbind(x, d[['PM2.5']]),
+       ref = cbind(x, d[['value']]),
+       cor = cbind(x, d[['PM2.5_cor']]),
+       interval = cbind(x, d[['PM2.5_cor_lower']], d[['PM2.5_cor_upper']]))
+})
+names(popup_data) <- as.character(pie_data$id)
+
+# JavaScript: widen the popup and draw the chart of the sensor when its popup opens
+popup_chart_js <- "
+function(el, x, data) {
+  this.on('popupopen', function(e) {
+    if (!e.popup._contentNode.querySelector('.hc-popup')) return;
+    e.popup.options.maxWidth = 520;
+    e.popup.options.minWidth = 500;
+    e.popup.update();
+    setTimeout(function() {
+      var div = e.popup._contentNode.querySelector('.hc-popup');
+      if (!div) return;
+      if (typeof Highcharts === 'undefined') {
+        div.innerHTML = 'Highcharts is not loaded.';
+        return;
+      }
+      var id = div.getAttribute('data-id');
+      var d = data[id];
+      Highcharts.chart(div, {
+        chart: {zoomType: 'x'},
+        title: {text: 'Sensor ' + id, style: {fontSize: '13px'}},
+        credits: {enabled: false},
+        exporting : {enabled: false},
+        xAxis: {type: 'datetime'},
+        yAxis: {min: 0, title: {useHTML: true, text: 'PM<sub>2.5</sub> (&mu;g m<sup>-3</sup>)'}},
+        tooltip: {shared: true, valueDecimals: 1, xDateFormat: '%Y-%m-%d %H:%M'},
+        legend: {itemStyle: {fontSize: '11px'}},
+        plotOptions: {series: {label: {enabled: false},
+                       marker: {enabled: false, symbol: 'circle', radius: 3,
+                                states: {hover: {radius: 4}}}}},
+        series: [
+          {name: 'Prediction interval', type: 'arearange', data: d.interval,
+           color: '#2a78d6', fillOpacity: 0.2, lineWidth: 0, enableMouseTracking: false},
+          {name: 'Raw', type: 'line', data: d.raw, color: '#eb6834', lineWidth: 1},
+          {name: 'Reference', type: 'line', data: d.ref, color: '#333333', lineWidth: 1},
+          {name: 'Corrected', type: 'line', data: d.cor, color: '#2a78d6', lineWidth: 1.5}
+        ]
+      });
+    }, 50);
+  });
+}"
+#
+sensor_map <- leaflet(width = "100%", height = 450) %>%
+  addProviderTiles("Esri.WorldTopoMap") %>%
+  addCircleMarkers(data = reference_info,
+                   lng = ~longitude, lat = ~latitude,
+                   popup = ~paste("<b>Reference station:</b>", id),
+                   color = "#000000", radius = 3, fillOpacity = 0.9) %>%
+  addMinicharts(lng = pie_data$longitude, lat = pie_data$latitude,
+                type = "pie",
+                chartdata = as.matrix(pie_data[, corr_levels]),
+                colorPalette = corr_colors,
+                width = 22,
+                layerId = as.character(pie_data$id),
+                popup = popupArgs(html = popup_html),
+                legendPosition = "topright") %>%
+  onRender(popup_chart_js, data = popup_data)
+
+# attach the Highcharts library to the map, so the popups can draw charts on their own
+sensor_map$dependencies <- c(sensor_map$dependencies,
+                             htmlwidgets::getDependency("highchart", "highcharter"))
+sensor_map
+```

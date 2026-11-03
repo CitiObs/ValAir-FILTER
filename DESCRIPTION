@@ -1,0 +1,31 @@
+Package: rFILTER
+Title: Framework for Improving Low-cost Technology Effectiveness and
+    Reliability (FILTER)
+Version: 0.1.0
+Authors@R: 
+    person("Vasileios", "Salamalikis", , "vsal@nilu.no", role = c("aut", "cre"))
+Description: Functions for quality control and correction of
+    environmental sensor data.
+License: GPL-3
+Depends: 
+    R (>= 3.5)
+Imports:
+    stats,
+    tibble,
+    dplyr,
+    tidyr,
+    sf,
+    runner,
+    lubridate,
+    zoo,
+    rlang,
+    MASS
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+LazyData: true
+Config/roxygen2/version: 8.0.0
+URL: https://github.com/Vsal85/rFILTER
+BugReports: https://github.com/Vsal85/rFILTER/issues
+Suggests: 
+    knitr,
+    rmarkdown
